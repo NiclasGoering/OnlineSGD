@@ -18,6 +18,7 @@ from functools import partial
 from torch.cuda.amp import GradScaler
 import gzip
 import io
+import math
 
 # Import the DeepNN class
 from helpers.FFNN_sgd import DeepNN
@@ -39,6 +40,141 @@ PHI_FUNCTIONS = {
     "log": lambda x: torch.log(torch.abs(x) + 1e-10),  # Log with safety
     "sqrt": lambda x: torch.sqrt(torch.abs(x) + 1e-10),  # Square root with safety
 }
+
+def estimate_gradient_noise_scale(
+    model: nn.Module, 
+    X: torch.Tensor, 
+    y: torch.Tensor, 
+    device: torch.device,
+    num_samples: int = 8
+) -> float:
+    """
+    Estimate the Gradient Noise Scale (GNS) - the ratio of gradient variance to squared gradient norm.
+    
+    Args:
+        model: The neural network model
+        X: Input tensor
+        y: Target tensor
+        device: Device to place tensors on
+        num_samples: Number of small batches to use for estimation
+        
+    Returns:
+        Gradient Noise Scale (float)
+    """
+    model.train()
+    
+    # Split data into smaller mini-batches for noise estimation
+    batch_size = X.shape[0]
+    if batch_size < num_samples:
+        num_samples = batch_size
+    
+    mini_batch_size = batch_size // num_samples
+    gradients = []
+    
+    # Compute gradients on several mini-batches
+    for i in range(num_samples):
+        start_idx = i * mini_batch_size
+        end_idx = start_idx + mini_batch_size if i < num_samples - 1 else batch_size
+        
+        X_mini = X[start_idx:end_idx]
+        y_mini = y[start_idx:end_idx]
+        
+        model.zero_grad()
+        with torch.amp.autocast('cuda'):
+            outputs = model(X_mini)
+            loss = torch.mean((outputs - y_mini) ** 2)
+        
+        loss.backward()
+        
+        # Collect and flatten gradients
+        grads = []
+        for p in model.parameters():
+            if p.grad is not None:
+                grads.append(p.grad.detach().clone().flatten())
+        
+        if grads:
+            flat_grad = torch.cat(grads)
+            gradients.append(flat_grad)
+    
+    if not gradients:
+        return float('nan')
+    
+    # Stack all gradient samples
+    grad_tensor = torch.stack(gradients)
+    
+    # Calculate mean gradient
+    mean_grad = torch.mean(grad_tensor, dim=0)
+    
+    # Estimate trace of covariance matrix (gradient variance)
+    deviations = grad_tensor - mean_grad
+    trace_cov = torch.mean(torch.sum(deviations * deviations, dim=1))
+    
+    # Calculate squared norm of mean gradient
+    mean_grad_squared_norm = torch.sum(mean_grad * mean_grad)
+    
+    # Calculate GNS
+    epsilon = 1e-10
+    gns = trace_cov / (mean_grad_squared_norm + epsilon)
+    
+    return gns.item()
+
+def adapt_batch_size(gns: float, current_batch_size: int, min_batch_size: int = 64, max_batch_size: int = 8192) -> int:
+    """
+    Adapt batch size based on GNS.
+    
+    Args:
+        gns: Gradient Noise Scale
+        current_batch_size: Current batch size
+        min_batch_size: Minimum allowed batch size
+        max_batch_size: Maximum allowed batch size
+        
+    Returns:
+        New batch size
+    """
+    # Clip GNS to reasonable range to avoid extreme values
+    capped_gns = min(max(gns, 0.1), 1000)
+    
+    # Higher GNS means we need larger batch sizes to reduce noise
+    # Use log scale for smoother transitions
+    log_gns = math.log(capped_gns)
+    
+    # Scale factor based on GNS
+    # When GNS is high, we want larger batches
+    scale_factor = 1.0 + (log_gns / 5.0) 
+    
+    # Calculate target batch size
+    target_batch_size = current_batch_size * scale_factor
+    
+    # Round to power of 2 for efficiency
+    power = round(math.log2(target_batch_size))
+    new_batch_size = 2 ** power
+    
+    # Constrain to min/max range
+    new_batch_size = max(min(new_batch_size, max_batch_size), min_batch_size)
+    
+    return new_batch_size
+
+def blend_batch_sizes(old_batch_size: int, new_batch_size: int, blend_factor: float = 0.3) -> int:
+    """
+    Blend between old and new batch sizes for smoother transitions.
+    
+    Args:
+        old_batch_size: Current batch size
+        new_batch_size: Target batch size
+        blend_factor: Blending factor (0-1), higher means faster adaptation
+        
+    Returns:
+        Blended batch size
+    """
+    # Blend in log space for smoother transitions
+    log_old = math.log2(old_batch_size)
+    log_new = math.log2(new_batch_size)
+    log_blend = log_old + blend_factor * (log_new - log_old)
+    
+    # Convert back and round to nearest power of 2
+    blended = 2 ** round(log_blend)
+    
+    return int(blended)
 
 def estimate_lipschitz_constant(model: nn.Module, X: torch.Tensor, device: torch.device) -> float:
     """
@@ -637,8 +773,7 @@ def train_model(
 ) -> None:
     """
     Train a model with the given configuration on a specific GPU.
-    Enhanced version supporting complex staircase functions.
-    Fixed to handle torch.compile() correctly.
+    Enhanced version supporting complex staircase functions and GNS-based batch size adaptation.
     """
     # Import torch and other required modules inside the function
     # This ensures they are properly imported in the worker process
@@ -693,6 +828,14 @@ def train_model(
             # Create models directory
             models_dir = os.path.join(results_dir, "models")
             os.makedirs(models_dir, exist_ok=True)
+        
+        # GNS configuration
+        gns_min_batch_size = config['base_config'].get('gns', {}).get('min_batch_size', 64)
+        gns_max_batch_size = config['base_config'].get('gns', {}).get('max_batch_size', 8192)
+        gns_blend_factor = config['base_config'].get('gns', {}).get('blend_factor', 0.3)
+        gns_check_intervals = [10, 100, 1000, 10000]  # Check at these specific iterations
+        
+        print(f"[GPU {gpu_id}] GNS-based batch size adaptation enabled with min={gns_min_batch_size}, max={gns_max_batch_size}, blend={gns_blend_factor}")
         
         # Process queue items until we receive None
         while True:
@@ -786,20 +929,15 @@ def train_model(
                 if use_gradient_clipping:
                     print(f"[GPU {gpu_id}] Using gradient clipping with max norm: {max_grad_norm}")
                 
-                # Super-batch size: how many data points to generate at once
-                # This reduces the overhead of frequently generating new data
-                super_batch_size = batch_size * 100  # Generate 100 batches worth of data at once
-                
-                # STORAGE OPTIMIZATION: Only store stats at specific intervals
-                stat_interval = 1000  # Record training and lipschitz stats every 100 epochs
-                eval_interval = 5000  # How often to evaluate on test set
-                save_interval = eval_interval * 5  # How often to save results to disk
+                # Current batch size (will be adapted by GNS)
+                current_batch_size = batch_size
                 
                 # Storage for summarized training history
                 train_stats = []  # Will store [iter_num, mean_loss, variance_loss]
                 lipschitz_metrics = []  # Will store [iter_num, lipschitz_constant, norm_loss, raw_loss]
                 test_metrics = []  # Will store [iter_num, test_loss]
                 term_test_metrics = []  # Will store [iter_num, [term1_loss, term2_loss, ...]]
+                gns_metrics = []  # Will store [iter_num, gns_value, batch_size]
                 
                 # Storage for our advanced metrics
                 term_pti_metrics = []  # Will store [iter_num, {pti_metrics}]
@@ -823,6 +961,11 @@ def train_model(
                     initial_model_path = os.path.join(models_dir, f"{unique_id}_initial.pth.gz")
                     save_compressed_model(model, initial_model_path)
                 
+                # Set up intervals for GNS checks (10, 100, 1000, 10000, and every 50k)
+                gns_check_iterations = set(gns_check_intervals)
+                for i in range(50000, total_iterations + 1, 50000):
+                    gns_check_iterations.add(i)
+                
                 # Training loop
                 iteration = 0
                 
@@ -838,72 +981,62 @@ def train_model(
                 current_lip_norm_losses.append(initial_norm_loss)
                 current_lip_raw_losses.append(initial_raw_loss)
                 
-                # Generate data in chunks to reduce overhead while still respecting online SGD
+                # Calculate initial GNS on test set
+                initial_gns = estimate_gradient_noise_scale(model, X_test[:1000], y_test[:1000], device)
+                gns_metrics.append([0, initial_gns, current_batch_size])
+                print(f"[GPU {gpu_id}] Initial GNS: {initial_gns:.4f}, Starting batch size: {current_batch_size}")
+                
+                # Training loop with GNS-based batch size adaptation
                 while iteration < total_iterations and not early_stopping_triggered:
-                    # Calculate how many samples to generate in this chunk
-                    samples_to_generate = min(super_batch_size, (total_iterations - iteration) * batch_size)
-                    
-                    # Generate a large chunk of training data
-                    X_chunk, y_chunk = generate_staircase_data(
-                        n_samples=samples_to_generate,
+                    # Generate training data for current batch
+                    X_batch, y_batch = generate_staircase_data(
+                        n_samples=current_batch_size,
                         input_dim=input_dim,
                         complex_terms=complex_terms,
                         device=device,
                         distribution=input_distribution
                     )
                     
-                    # Process this chunk in small batches (respecting online SGD)
-                    num_super_batches = (len(X_chunk) + batch_size - 1) // batch_size
+                    # Zero gradients
+                    optimizer.zero_grad()
                     
-                    for i in range(num_super_batches):
-                        if iteration >= total_iterations or early_stopping_triggered:
-                            break
-                            
-                        # Get a small batch from the super-batch
-                        start_idx = i * batch_size
-                        end_idx = min(start_idx + batch_size, len(X_chunk))
-                        X_batch = X_chunk[start_idx:end_idx]
-                        y_batch = y_chunk[start_idx:end_idx]
-                        
-                        # Zero gradients
-                        optimizer.zero_grad()
-                        
-                        # Forward pass with autocast (mixed precision)
-                        with torch.amp.autocast('cuda'):
-                            outputs = model(X_batch)
-                            loss = torch.mean((outputs - y_batch) ** 2)
-                        
-                        # Backward pass with scaler
-                        scaler.scale(loss).backward()
-                        
-                        # Apply gradient clipping if enabled
-                        if use_gradient_clipping:
-                            # Unscale gradients before clipping
-                            scaler.unscale_(optimizer)
-                            # Clip gradients to max_norm
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                        
-                        # Update parameters with scaler to maintain mixed precision
-                        scaler.step(optimizer)
-                        scaler.update()
-                        
-                        # Record loss for this batch
-                        train_loss = loss.item()
-                        current_train_losses.append(train_loss)
-                        
-                        # Early stopping check
-                        if early_stopping_enabled:
-                            if train_loss < early_stopping_threshold:
-                                below_threshold_count += 1
-                                if below_threshold_count >= early_stopping_patience:
-                                    print(f"[GPU {gpu_id}] {unique_id} - Early stopping triggered at iteration {iteration}. "
-                                          f"Loss below {early_stopping_threshold} for {early_stopping_patience} consecutive iterations.")
-                                    early_stopping_triggered = True
-                                    break
-                            else:
-                                below_threshold_count = 0  # Reset the counter if loss is above threshold
-                        
-                        # Calculate Lipschitz constant and normalized loss for this batch (without backprop)
+                    # Forward pass with autocast (mixed precision)
+                    with torch.amp.autocast('cuda'):
+                        outputs = model(X_batch)
+                        loss = torch.mean((outputs - y_batch) ** 2)
+                    
+                    # Backward pass with scaler
+                    scaler.scale(loss).backward()
+                    
+                    # Apply gradient clipping if enabled
+                    if use_gradient_clipping:
+                        # Unscale gradients before clipping
+                        scaler.unscale_(optimizer)
+                        # Clip gradients to max_norm
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    
+                    # Update parameters with scaler to maintain mixed precision
+                    scaler.step(optimizer)
+                    scaler.update()
+                    
+                    # Record loss for this batch
+                    train_loss = loss.item()
+                    current_train_losses.append(train_loss)
+                    
+                    # Early stopping check
+                    if early_stopping_enabled:
+                        if train_loss < early_stopping_threshold:
+                            below_threshold_count += 1
+                            if below_threshold_count >= early_stopping_patience:
+                                print(f"[GPU {gpu_id}] {unique_id} - Early stopping triggered at iteration {iteration}. "
+                                      f"Loss below {early_stopping_threshold} for {early_stopping_patience} consecutive iterations.")
+                                early_stopping_triggered = True
+                                break
+                        else:
+                            below_threshold_count = 0  # Reset the counter if loss is above threshold
+                    
+                    # Calculate Lipschitz constant and normalized loss occasionally (to save computation)
+                    if iteration % 100 == 0:
                         model.eval()
                         batch_lip_constant = estimate_lipschitz_constant(model, X_batch, device)
                         batch_norm_loss, batch_raw_loss = calculate_lipschitz_normalized_loss(
@@ -915,256 +1048,304 @@ def train_model(
                         current_lip_constants.append(batch_lip_constant)
                         current_lip_norm_losses.append(batch_norm_loss)
                         current_lip_raw_losses.append(batch_raw_loss)
+                    
+                    # Increment iteration counter
+                    iteration += 1
+                    
+                    # Check if we need to measure GNS at this iteration
+                    if iteration in gns_check_iterations:
+                        # Calculate GNS on test set (use a subset for efficiency)
+                        test_sample_size = min(2000, len(X_test))
+                        sample_indices = torch.randperm(len(X_test))[:test_sample_size]
+                        X_sample = X_test[sample_indices]
+                        y_sample = y_test[sample_indices]
                         
-                        # Increment iteration counter
-                        iteration += 1
+                        # Calculate GNS
+                        current_gns = estimate_gradient_noise_scale(model, X_sample, y_sample, device)
                         
-                        # Save model at specific iterations if requested
-                        if save_models and str(iteration) in [str(m) for m in save_models if isinstance(m, (int, float))]:
-                            model_path = os.path.join(models_dir, f"{unique_id}_iter{iteration}.pth.gz")
-                            save_compressed_model(model, model_path)
-                        
-                        # Record metrics at fixed stat_interval (100 iterations)
-                        if iteration % stat_interval == 0:
-                            # Calculate mean and variance for training losses
-                            if current_train_losses:
-                                mean_train_loss = sum(current_train_losses) / len(current_train_losses)
-                                variance_train = sum((x - mean_train_loss) ** 2 for x in current_train_losses) / len(current_train_losses) if len(current_train_losses) > 1 else 0.0
-                                
-                                # Store training stats - use float32 for iteration number
-                                train_stats.append([float(iteration), mean_train_loss, variance_train])
-                                
-                                # Reset training loss buffer
-                                current_train_losses = []
-                            
-                            # Calculate mean for Lipschitz metrics
-                            if current_lip_constants:
-                                mean_lip_constant = sum(current_lip_constants) / len(current_lip_constants)
-                                mean_lip_norm_loss = sum(current_lip_norm_losses) / len(current_lip_norm_losses)
-                                mean_lip_raw_loss = sum(current_lip_raw_losses) / len(current_lip_raw_losses)
-                                
-                                # Store Lipschitz metrics - use float32 for iteration number
-                                lipschitz_metrics.append([float(iteration), mean_lip_constant, mean_lip_norm_loss, mean_lip_raw_loss])
-                                
-                                # Reset Lipschitz metric buffers
-                                current_lip_constants = []
-                                current_lip_norm_losses = []
-                                current_lip_raw_losses = []
-                            
-                            # Log progress
-                            print(f"[GPU {gpu_id}] {unique_id} - Iteration {iteration}/{total_iterations}, "
-                                  f"Train Loss: {mean_train_loss:.6f}, Lipschitz Norm Loss: {mean_lip_norm_loss:.6f}")
-                        
-                        # Only evaluate on test set at specific intervals OR at the final iteration
-                        should_evaluate = (
-                            (iteration % eval_interval == 0) or 
-                            (iteration == 1) or 
-                            (iteration == total_iterations) or
-                            early_stopping_triggered
+                        # Adapt batch size based on GNS
+                        target_batch_size = adapt_batch_size(
+                            current_gns, 
+                            current_batch_size,
+                            min_batch_size=gns_min_batch_size,
+                            max_batch_size=gns_max_batch_size
                         )
                         
-                        if should_evaluate:
-                            model.eval()
-                            with torch.no_grad():
-                                # Calculate full test loss, being careful with compiled model
-                                test_loss = evaluate_test_loss(model, X_test, y_test)
-                            
-                            # Record test metrics - use float32 for iteration number
-                            test_metrics.append([float(iteration), test_loss])
-                            
-                            # Calculate original term-specific losses
-                            term_losses = calculate_term_test_losses(
-                                model=model,
-                                X=X_test,
-                                complex_terms=complex_terms,
-                                device=device
-                            )
-                            
-                            # Store term test losses with iteration number
-                            term_test_metrics.append([float(iteration), term_losses])
-                            
-                            # Calculate Progressive Term Isolation metrics
-                            pti_results = calculate_progressive_term_isolation(
-                                model=model,
-                                X=X_test,
-                                complex_terms=complex_terms,
-                                device=device
-                            )
-                            
-                            # Store PTI metrics with iteration number
-                            term_pti_metrics.append([float(iteration), pti_results])
-                            
-                            # Calculate Term Gradient Alignment metrics conditionally
-                            gradient_results = None
-                            if calculate_gradient_alignment:
-                                model.train()
-                                gradient_results = calculate_term_gradient_alignment(
-                                    model=model,
-                                    X=X_test,
-                                    y=y_test,
-                                    complex_terms=complex_terms,
-                                    device=device
-                                )
-                                
-                                # Store gradient metrics with iteration number
-                                term_gradient_metrics.append([float(iteration), gradient_results])
-                                
-                                # Switch back to eval mode for logging
-                                model.eval()
-                            
-                            # Get the most recent Lipschitz metrics
-                            if lipschitz_metrics:
-                                recent_lip_constant = lipschitz_metrics[-1][1]
-                                recent_lip_norm_loss = lipschitz_metrics[-1][2]
-                            else:
-                                recent_lip_constant = 0.0
-                                recent_lip_norm_loss = 0.0
-                                
-                            # Get the most recent training loss
-                            if train_stats:
-                                recent_train_loss = train_stats[-1][1]
-                            else:
-                                recent_train_loss = 0.0
-                            
-                            # Log test results with individual term losses
-                            print(f"[GPU {gpu_id}] {unique_id} - Iteration {iteration}/{total_iterations}, "
-                                  f"Train Loss: {recent_train_loss:.6f}, Test Loss: {test_loss:.6f}, "
-                                  f"Lipschitz: {recent_lip_constant:.4f}, Norm Loss: {recent_lip_norm_loss:.8f}")
-                            
-                            # Log term metrics in a more readable format
-                            term_loss_strings = []
-                            for i, (desc, loss) in enumerate(zip(term_descriptions, term_losses)):
-                                # Include PTI correlation
-                                corr = pti_results['correlation_ratios'][i]
-                                # Include gradient alignment if available
-                                if gradient_results:
-                                    gradient_align = gradient_results['gradient_alignment'][i]
-                                    term_loss_strings.append(f"Term {i+1} ({desc}): MSE={loss:.6f}, Corr={corr:.3f}, Grad={gradient_align:.3f}")
-                                else:
-                                    term_loss_strings.append(f"Term {i+1} ({desc}): MSE={loss:.6f}, Corr={corr:.3f}")
-                            
-                            print(f"[GPU {gpu_id}] Term Metrics: {' | '.join(term_loss_strings)}")
-                            
-                            # Save current results at checkpoints using compressed NPZ
-                            if iteration % save_interval == 0 or iteration == total_iterations or early_stopping_triggered:
-                                result_file = os.path.join(results_dir, f"{unique_id}.npz")
-                                
-                                # Convert lists to numpy arrays with float32 precision for numerical stability
-                                train_stats_np = np.array(train_stats, dtype=np.float32)
-                                test_metrics_np = np.array(test_metrics, dtype=np.float32)
-                                
-                                # Extract iterations and term losses for efficient storage
-                                term_iterations = np.array([t[0] for t in term_test_metrics], dtype=np.float32)
-                                term_losses_array = np.array([t[1] for t in term_test_metrics], dtype=np.float32)
-                                
-                                # Process PTI metrics efficiently
-                                pti_iterations = np.array([t[0] for t in term_pti_metrics], dtype=np.float32)
-                                pti_correlation_ratios = np.array([t[1]['correlation_ratios'] for t in term_pti_metrics], dtype=np.float32)
-                                pti_residual_mse = np.array([t[1]['residual_mse'] for t in term_pti_metrics], dtype=np.float32)
-                                
-                                # Process Lipschitz metrics
-                                lipschitz_iterations = np.array([t[0] for t in lipschitz_metrics], dtype=np.float32)
-                                lipschitz_constants = np.array([t[1] for t in lipschitz_metrics], dtype=np.float32)
-                                lipschitz_normalized_losses = np.array([t[2] for t in lipschitz_metrics], dtype=np.float32)
-                                lipschitz_raw_losses = np.array([t[3] for t in lipschitz_metrics], dtype=np.float32)
-                                
-                                # Process gradient alignment metrics if calculated
-                                grad_iterations = None
-                                grad_alignment = None
-                                grad_magnitude_ratio = None
-                                
-                                if calculate_gradient_alignment and term_gradient_metrics:
-                                    grad_iterations = np.array([t[0] for t in term_gradient_metrics], dtype=np.float32)
-                                    grad_alignment = np.array([t[1]['gradient_alignment'] for t in term_gradient_metrics], dtype=np.float32)
-                                    grad_magnitude_ratio = np.array([t[1]['gradient_magnitude_ratio'] for t in term_gradient_metrics], dtype=np.float32)
-                                
-                                # Store term descriptions for context
-                                term_descriptions_array = np.array([desc for desc in term_descriptions])
-                                
-                                # Store metadata as a dictionary
-                                metadata = {
-                                    'function_name': function['name'],
-                                    'input_dim': input_dim,
-                                    'input_distribution': input_distribution,
-                                    'hidden_size': hidden_size,
-                                    'depth': depth,
-                                    'learning_rate': lr,
-                                    'batch_size': batch_size,  # Include batch size in metadata
-                                    'mode': mode,
-                                    'alignment': align,
-                                    'experiment_num': exp_num,
-                                    'final_train_loss': float(train_stats[-1][1]) if train_stats else float('nan'),
-                                    'final_test_loss': test_loss,
-                                    'final_lipschitz_constant': float(lipschitz_constants[-1]) if len(lipschitz_constants) > 0 else float('nan'),
-                                    'final_normalized_loss': float(lipschitz_normalized_losses[-1]) if len(lipschitz_normalized_losses) > 0 else float('nan'),
-                                    'optimizer': optimizer_type,
-                                    'unique_id': unique_id,
-                                    'gpu_id': gpu_id,
-                                    'total_iterations': total_iterations,
-                                    'current_iteration': iteration,
-                                    'final_term_losses': term_losses,
-                                    'term_descriptions': term_descriptions,
-                                    'calculate_gradient_alignment': calculate_gradient_alignment,
-                                    'early_stopping_triggered': early_stopping_triggered
-                                }
-                                
-                                # Store complex terms in a serializable format for reconstruction
-                                serializable_terms = []
-                                for term_dict in complex_terms:
-                                    serializable_term = {
-                                        'indices': term_dict['indices'],
-                                        'phi': term_dict.get('phi', 'id'),
-                                        'coefficient': float(term_dict.get('coefficient', 1.0))
-                                    }
-                                    serializable_terms.append(serializable_term)
-                                
-                                metadata['complex_terms'] = serializable_terms
-                                
-                                # Create a dictionary of data to save
-                                save_data = {
-                                    # Original metrics
-                                    'train_stats': train_stats_np,
-                                    'test_metrics': test_metrics_np,
-                                    'term_iterations': term_iterations,
-                                    'term_losses': term_losses_array,
-                                    'term_descriptions': term_descriptions_array,
-                                    
-                                    # PTI metrics
-                                    'pti_iterations': pti_iterations,
-                                    'pti_correlation_ratios': pti_correlation_ratios,
-                                    'pti_residual_mse': pti_residual_mse,
-                                    
-                                    # Lipschitz metrics
-                                    'lipschitz_iterations': lipschitz_iterations,
-                                    'lipschitz_constants': lipschitz_constants,
-                                    'lipschitz_normalized_losses': lipschitz_normalized_losses,
-                                    'lipschitz_raw_losses': lipschitz_raw_losses,
-                                    
-                                    # Metadata
-                                    'metadata': np.array([str(metadata)])
-                                }
-                                
-                                # Add gradient alignment metrics if available
-                                if calculate_gradient_alignment and grad_iterations is not None:
-                                    save_data.update({
-                                        'grad_iterations': grad_iterations,
-                                        'grad_alignment': grad_alignment,
-                                        'grad_magnitude_ratio': grad_magnitude_ratio
-                                    })
-                                
-                                # Save NPZ file with all metrics
-                                np.savez_compressed(result_file, **save_data)
-                            
-                            # Switch back to training mode
-                            model.train()
+                        # Blend batch sizes for smoother transition
+                        new_batch_size = blend_batch_sizes(
+                            current_batch_size, 
+                            target_batch_size,
+                            blend_factor=gns_blend_factor
+                        )
                         
-                        # Log training progress occasionally without writing to disk
-                        elif iteration % 1000 == 0:
-                            if train_stats:
-                                avg_train_loss = train_stats[-1][1]
-                                avg_lip_loss = lipschitz_metrics[-1][2] if lipschitz_metrics else 0.0
-                                print(f"[GPU {gpu_id}] {unique_id} - Iteration {iteration}/{total_iterations}, "
-                                      f"Train Loss: {avg_train_loss:.6f}, Lip Norm Loss: {avg_lip_loss:.6f}")
+                        # Update current batch size
+                        current_batch_size = new_batch_size
+                        
+                        # Record GNS and batch size
+                        gns_metrics.append([iteration, current_gns, current_batch_size])
+                        
+                        # Log GNS and batch size adaptation
+                        print(f"[GPU {gpu_id}] Iteration {iteration}: GNS={current_gns:.4f}, Adapted batch size={current_batch_size}")
+                    
+                    # Save model at specific iterations if requested
+                    if save_models and str(iteration) in [str(m) for m in save_models if isinstance(m, (int, float))]:
+                        model_path = os.path.join(models_dir, f"{unique_id}_iter{iteration}.pth.gz")
+                        save_compressed_model(model, model_path)
+                    
+                    # Record metrics at fixed intervals
+                    stat_interval = 1000  # Record training and lipschitz stats every 1000 iterations
+                    
+                    if iteration % stat_interval == 0:
+                        # Calculate mean and variance for training losses
+                        if current_train_losses:
+                            mean_train_loss = sum(current_train_losses) / len(current_train_losses)
+                            variance_train = sum((x - mean_train_loss) ** 2 for x in current_train_losses) / len(current_train_losses) if len(current_train_losses) > 1 else 0.0
+                            
+                            # Store training stats - use float32 for iteration number
+                            train_stats.append([float(iteration), mean_train_loss, variance_train])
+                            
+                            # Reset training loss buffer
+                            current_train_losses = []
+                        
+                        # Calculate mean for Lipschitz metrics
+                        if current_lip_constants:
+                            mean_lip_constant = sum(current_lip_constants) / len(current_lip_constants)
+                            mean_lip_norm_loss = sum(current_lip_norm_losses) / len(current_lip_norm_losses)
+                            mean_lip_raw_loss = sum(current_lip_raw_losses) / len(current_lip_raw_losses)
+                            
+                            # Store Lipschitz metrics - use float32 for iteration number
+                            lipschitz_metrics.append([float(iteration), mean_lip_constant, mean_lip_norm_loss, mean_lip_raw_loss])
+                            
+                            # Reset Lipschitz metric buffers
+                            current_lip_constants = []
+                            current_lip_norm_losses = []
+                            current_lip_raw_losses = []
+                        
+                        # Log progress
+                        print(f"[GPU {gpu_id}] {unique_id} - Iteration {iteration}/{total_iterations}, "
+                              f"Train Loss: {mean_train_loss:.6f}, Batch Size: {current_batch_size}")
+                    
+                    # Only evaluate on test set at specific intervals OR at the final iteration
+                    eval_interval = 10000  # Evaluate on test set every 10,000 iterations
+                    should_evaluate = (
+                        (iteration % eval_interval == 0) or 
+                        (iteration in [1, 10, 100, 1000, 10000]) or  # Evaluate at these specific iterations
+                        (iteration == total_iterations) or
+                        early_stopping_triggered
+                    )
+                    
+                    if should_evaluate:
+                        model.eval()
+                        with torch.no_grad():
+                            # Calculate full test loss, being careful with compiled model
+                            test_loss = evaluate_test_loss(model, X_test, y_test)
+                        
+                        # Record test metrics - use float32 for iteration number
+                        test_metrics.append([float(iteration), test_loss])
+                        
+                        # Calculate original term-specific losses
+                        term_losses = calculate_term_test_losses(
+                            model=model,
+                            X=X_test,
+                            complex_terms=complex_terms,
+                            device=device
+                        )
+                        
+                        # Store term test losses with iteration number
+                        term_test_metrics.append([float(iteration), term_losses])
+                        
+                        # Calculate Progressive Term Isolation metrics
+                        pti_results = calculate_progressive_term_isolation(
+                            model=model,
+                            X=X_test,
+                            complex_terms=complex_terms,
+                            device=device
+                        )
+                        
+                        # Store PTI metrics with iteration number
+                        term_pti_metrics.append([float(iteration), pti_results])
+                        
+                        # Calculate Term Gradient Alignment metrics conditionally
+                        gradient_results = None
+                        if calculate_gradient_alignment:
+                            model.train()
+                            gradient_results = calculate_term_gradient_alignment(
+                                model=model,
+                                X=X_test,
+                                y=y_test,
+                                complex_terms=complex_terms,
+                                device=device
+                            )
+                            
+                            # Store gradient metrics with iteration number
+                            term_gradient_metrics.append([float(iteration), gradient_results])
+                            
+                            # Switch back to eval mode for logging
+                            model.eval()
+                        
+                        # Get the most recent Lipschitz metrics
+                        if lipschitz_metrics:
+                            recent_lip_constant = lipschitz_metrics[-1][1]
+                            recent_lip_norm_loss = lipschitz_metrics[-1][2]
+                        else:
+                            recent_lip_constant = 0.0
+                            recent_lip_norm_loss = 0.0
+                            
+                        # Get the most recent training loss
+                        if train_stats:
+                            recent_train_loss = train_stats[-1][1]
+                        else:
+                            recent_train_loss = 0.0
+                        
+                        # Log test results with individual term losses
+                        print(f"[GPU {gpu_id}] {unique_id} - Iteration {iteration}/{total_iterations}, "
+                              f"Train Loss: {recent_train_loss:.6f}, Test Loss: {test_loss:.6f}, "
+                              f"Batch Size: {current_batch_size}, Lipschitz: {recent_lip_constant:.4f}")
+                        
+                        # Log term metrics in a more readable format
+                        term_loss_strings = []
+                        for i, (desc, loss) in enumerate(zip(term_descriptions, term_losses)):
+                            # Include PTI correlation
+                            corr = pti_results['correlation_ratios'][i]
+                            # Include gradient alignment if available
+                            if gradient_results:
+                                gradient_align = gradient_results['gradient_alignment'][i]
+                                term_loss_strings.append(f"Term {i+1} ({desc}): MSE={loss:.6f}, Corr={corr:.3f}, Grad={gradient_align:.3f}")
+                            else:
+                                term_loss_strings.append(f"Term {i+1} ({desc}): MSE={loss:.6f}, Corr={corr:.3f}")
+                        
+                        print(f"[GPU {gpu_id}] Term Metrics: {' | '.join(term_loss_strings)}")
+                        
+                        # Save current results at checkpoints
+                        save_interval = eval_interval * 5  # Save results every 50,000 iterations
+                        if iteration % save_interval == 0 or iteration == total_iterations or early_stopping_triggered:
+                            result_file = os.path.join(results_dir, f"{unique_id}.npz")
+                            
+                            # Convert lists to numpy arrays with float32 precision for numerical stability
+                            train_stats_np = np.array(train_stats, dtype=np.float32)
+                            test_metrics_np = np.array(test_metrics, dtype=np.float32)
+                            gns_metrics_np = np.array(gns_metrics, dtype=np.float32)
+                            
+                            # Extract iterations and term losses for efficient storage
+                            term_iterations = np.array([t[0] for t in term_test_metrics], dtype=np.float32)
+                            term_losses_array = np.array([t[1] for t in term_test_metrics], dtype=np.float32)
+                            
+                            # Process PTI metrics efficiently
+                            pti_iterations = np.array([t[0] for t in term_pti_metrics], dtype=np.float32)
+                            pti_correlation_ratios = np.array([t[1]['correlation_ratios'] for t in term_pti_metrics], dtype=np.float32)
+                            pti_residual_mse = np.array([t[1]['residual_mse'] for t in term_pti_metrics], dtype=np.float32)
+                            
+                            # Process Lipschitz metrics
+                            lipschitz_iterations = np.array([t[0] for t in lipschitz_metrics], dtype=np.float32)
+                            lipschitz_constants = np.array([t[1] for t in lipschitz_metrics], dtype=np.float32)
+                            lipschitz_normalized_losses = np.array([t[2] for t in lipschitz_metrics], dtype=np.float32)
+                            lipschitz_raw_losses = np.array([t[3] for t in lipschitz_metrics], dtype=np.float32)
+                            
+                            # Process gradient alignment metrics if calculated
+                            grad_iterations = None
+                            grad_alignment = None
+                            grad_magnitude_ratio = None
+                            
+                            if calculate_gradient_alignment and term_gradient_metrics:
+                                grad_iterations = np.array([t[0] for t in term_gradient_metrics], dtype=np.float32)
+                                grad_alignment = np.array([t[1]['gradient_alignment'] for t in term_gradient_metrics], dtype=np.float32)
+                                grad_magnitude_ratio = np.array([t[1]['gradient_magnitude_ratio'] for t in term_gradient_metrics], dtype=np.float32)
+                            
+                            # Store term descriptions for context
+                            term_descriptions_array = np.array([desc for desc in term_descriptions])
+                            
+                            # Store metadata as a dictionary
+                            metadata = {
+                                'function_name': function['name'],
+                                'input_dim': input_dim,
+                                'input_distribution': input_distribution,
+                                'hidden_size': hidden_size,
+                                'depth': depth,
+                                'learning_rate': lr,
+                                'initial_batch_size': batch_size,
+                                'final_batch_size': current_batch_size,
+                                'mode': mode,
+                                'alignment': align,
+                                'experiment_num': exp_num,
+                                'final_train_loss': float(train_stats[-1][1]) if train_stats else float('nan'),
+                                'final_test_loss': test_loss,
+                                'final_lipschitz_constant': float(lipschitz_constants[-1]) if len(lipschitz_constants) > 0 else float('nan'),
+                                'final_normalized_loss': float(lipschitz_normalized_losses[-1]) if len(lipschitz_normalized_losses) > 0 else float('nan'),
+                                'optimizer': optimizer_type,
+                                'unique_id': unique_id,
+                                'gpu_id': gpu_id,
+                                'total_iterations': total_iterations,
+                                'current_iteration': iteration,
+                                'final_term_losses': term_losses,
+                                'term_descriptions': term_descriptions,
+                                'calculate_gradient_alignment': calculate_gradient_alignment,
+                                'early_stopping_triggered': early_stopping_triggered,
+                                'gns_enabled': True,
+                                'gns_min_batch_size': gns_min_batch_size,
+                                'gns_max_batch_size': gns_max_batch_size,
+                                'gns_blend_factor': gns_blend_factor
+                            }
+                            
+                            # Store complex terms in a serializable format for reconstruction
+                            serializable_terms = []
+                            for term_dict in complex_terms:
+                                serializable_term = {
+                                    'indices': term_dict['indices'],
+                                    'phi': term_dict.get('phi', 'id'),
+                                    'coefficient': float(term_dict.get('coefficient', 1.0))
+                                }
+                                serializable_terms.append(serializable_term)
+                            
+                            metadata['complex_terms'] = serializable_terms
+                            
+                            # Create a dictionary of data to save
+                            save_data = {
+                                # Original metrics
+                                'train_stats': train_stats_np,
+                                'test_metrics': test_metrics_np,
+                                'term_iterations': term_iterations,
+                                'term_losses': term_losses_array,
+                                'term_descriptions': term_descriptions_array,
+                                
+                                # GNS metrics
+                                'gns_metrics': gns_metrics_np,
+                                
+                                # PTI metrics
+                                'pti_iterations': pti_iterations,
+                                'pti_correlation_ratios': pti_correlation_ratios,
+                                'pti_residual_mse': pti_residual_mse,
+                                
+                                # Lipschitz metrics
+                                'lipschitz_iterations': lipschitz_iterations,
+                                'lipschitz_constants': lipschitz_constants,
+                                'lipschitz_normalized_losses': lipschitz_normalized_losses,
+                                'lipschitz_raw_losses': lipschitz_raw_losses,
+                                
+                                # Metadata
+                                'metadata': np.array([str(metadata)])
+                            }
+                            
+                            # Add gradient alignment metrics if available
+                            if calculate_gradient_alignment and grad_iterations is not None:
+                                save_data.update({
+                                    'grad_iterations': grad_iterations,
+                                    'grad_alignment': grad_alignment,
+                                    'grad_magnitude_ratio': grad_magnitude_ratio
+                                })
+                            
+                            # Save NPZ file with all metrics
+                            np.savez_compressed(result_file, **save_data)
+                        
+                        # Switch back to training mode
+                        model.train()
+                    
+                    # Log training progress occasionally without writing to disk
+                    elif iteration % 1000 == 0:
+                        if train_stats:
+                            avg_train_loss = train_stats[-1][1] if len(train_stats) > 0 else 0.0
+                            avg_lip_loss = lipschitz_metrics[-1][2] if len(lipschitz_metrics) > 0 else 0.0
+                            print(f"[GPU {gpu_id}] {unique_id} - Iteration {iteration}/{total_iterations}, "
+                                  f"Train Loss: {avg_train_loss:.6f}, Batch Size: {current_batch_size}")
                 
                 # Save final model if requested
                 if "final" in save_models:
@@ -1245,6 +1426,7 @@ def train_model(
                 # Convert lists to numpy arrays with float32 precision for numerical stability
                 train_stats_np = np.array(train_stats, dtype=np.float32)
                 test_metrics_np = np.array(test_metrics, dtype=np.float32)
+                gns_metrics_np = np.array(gns_metrics, dtype=np.float32)
                 
                 # Extract iterations and term losses for efficient storage
                 term_iterations = np.array([t[0] for t in term_test_metrics], dtype=np.float32)
@@ -1289,7 +1471,8 @@ def train_model(
                     'hidden_size': hidden_size,
                     'depth': depth,
                     'learning_rate': lr,
-                    'batch_size': batch_size,  # Include batch size in metadata
+                    'initial_batch_size': batch_size,
+                    'final_batch_size': current_batch_size,
                     'mode': mode,
                     'alignment': align,
                     'experiment_num': exp_num,
@@ -1305,7 +1488,11 @@ def train_model(
                     'final_term_losses': final_term_losses,
                     'term_descriptions': term_descriptions,
                     'calculate_gradient_alignment': calculate_gradient_alignment,
-                    'early_stopping_triggered': early_stopping_triggered
+                    'early_stopping_triggered': early_stopping_triggered,
+                    'gns_enabled': True,
+                    'gns_min_batch_size': gns_min_batch_size,
+                    'gns_max_batch_size': gns_max_batch_size,
+                    'gns_blend_factor': gns_blend_factor
                 }
                 
                 # Store complex terms in a serializable format for reconstruction
@@ -1328,6 +1515,9 @@ def train_model(
                     'term_iterations': term_iterations,
                     'term_losses': term_losses_array,
                     'term_descriptions': term_descriptions_array,
+                    
+                    # GNS metrics
+                    'gns_metrics': gns_metrics_np,
                     
                     # PTI metrics
                     'pti_iterations': pti_iterations,
@@ -1392,13 +1582,15 @@ def load_and_analyze_results(results_dir, pattern='*.npz'):
                     'unique_id': metadata['unique_id'],
                     'function_name': metadata['function_name'],
                     'input_distribution': metadata.get('input_distribution', 'binary'),
-                    'batch_size': metadata.get('batch_size', 0),  # Include batch size
+                    'initial_batch_size': metadata.get('initial_batch_size', metadata.get('batch_size', 0)),
+                    'final_batch_size': metadata.get('final_batch_size', metadata.get('batch_size', 0)),  
                     'final_test_loss': metadata['final_test_loss'],
                     'final_lipschitz_constant': metadata.get('final_lipschitz_constant', float('nan')),
                     'final_normalized_loss': metadata.get('final_normalized_loss', float('nan')),
                     'final_term_losses': metadata.get('final_term_losses', []),
                     'term_descriptions': metadata.get('term_descriptions', []),
-                    'early_stopping_triggered': metadata.get('early_stopping_triggered', False)
+                    'early_stopping_triggered': metadata.get('early_stopping_triggered', False),
+                    'gns_enabled': metadata.get('gns_enabled', False)
                 }
                 summary.append(summary_entry)
         except Exception as e:
@@ -1453,7 +1645,7 @@ def main():
     
     # Get hyperparameters for sweeping
     learning_rates = config['sweeps']['learning_rates']
-    batch_sizes = config['sweeps']['batch_sizes']  # New: iteratable batch sizes
+    batch_sizes = config['sweeps']['batch_sizes']  # Initial batch sizes
     hidden_sizes = config['sweeps']['hidden_sizes']
     depths = config['sweeps']['depths']
     modes = config['sweeps']['modes']
@@ -1463,6 +1655,14 @@ def main():
     # Get input distribution type
     input_distribution = config['base_config'].get('input_distribution', 'binary')
     print(f"Using input distribution: {input_distribution}")
+    
+    # Add GNS configuration to base_config if not present
+    if 'gns' not in config['base_config']:
+        config['base_config']['gns'] = {
+            'min_batch_size': 64,
+            'max_batch_size': 8192,
+            'blend_factor': 0.3
+        }
     
     # Generate all job configurations - now includes batch_size in combinations
     all_combinations = []

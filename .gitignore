@@ -3,3 +3,9 @@
 *.yaml
 *.pt
 *.txt
+*.gz
+*.csv
+*.npy
+*.json
+*.lock
+*.mp4

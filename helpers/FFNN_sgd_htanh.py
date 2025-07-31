@@ -7,6 +7,7 @@ from typing import List, Optional
 class DeepNN(nn.Module):
     """
     Modified DeepNN class that can store activations for load factor calculation.
+    Uses HardTanh activation instead of ReLU.
     """
     def __init__(
         self,
@@ -24,7 +25,6 @@ class DeepNN(nn.Module):
     ):
         super().__init__()
         
-        
         self.mode = mode
         self.depth = depth
         self.hidden_size = hidden_size
@@ -32,8 +32,6 @@ class DeepNN(nn.Module):
         self.base_width = base_width
         self.alignment = alignment
     
-
-        
         # Whether to store activations during forward pass (for load factor calculation)
         self.store_activations = store_activations
         self.hidden_activations = None
@@ -66,7 +64,7 @@ class DeepNN(nn.Module):
                 # Standard parameterization
                 if is_embedding:
                     # Embedding layer - initialization variance ~ 1
-                    init_std = 1.0 #/ np.sqrt(prev_dim)  #normally  init_std = 1.0
+                    init_std = 1.0 / np.sqrt(prev_dim)  #normally  init_std = 1.0
                     param_multiplier = 1.0  # param multiplier = 1
                 else:
                     # Hidden layers - initialization variance ~ 1/n
@@ -174,10 +172,11 @@ class DeepNN(nn.Module):
             self.layer_lrs.append(lr_scale)
             self.param_multipliers.append(param_multiplier)
             self.layers.append(linear)
-            self.layers.append(nn.ReLU())
+            # Replace ReLU with HardTanh
+            self.layers.append(nn.ELU())
             prev_dim = hidden_size
         
-        # Build readout layer with bias=False
+        # Build readout layer with bias=False^1
         final_layer = nn.Linear(prev_dim, 1, bias=False)
         
         # Configure readout layer based on mode
@@ -252,7 +251,6 @@ class DeepNN(nn.Module):
         # Convert param_multipliers to a tensor - it will be moved to the correct device in forward()
         self.register_buffer('param_multipliers_tensor', torch.tensor(self.param_multipliers, dtype=torch.float32))
 
-    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass with parameter multipliers applied correctly.
@@ -286,7 +284,7 @@ class DeepNN(nn.Module):
                     
                 linear_idx += 1
             else:
-                # For non-linear layers (ReLU), just apply normally
+                # For non-linear layers (now HardTanh), just apply normally
                 x = layer(x)
             
             # Store activations after each layer if needed
